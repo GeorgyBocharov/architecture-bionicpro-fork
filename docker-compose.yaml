@@ -111,12 +111,9 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
       
-      # ---------- ПОДКЛЮЧЕНИЕ К CLICKHOUSE (ДЛЯ DAG'ОВ) ----------
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: 9000
-      CLICKHOUSE_DB: reports_db
-      CLICKHOUSE_USER: airflow_user
-      CLICKHOUSE_PASSWORD: airflow_password
+      # ---------- ПОДКЛЮЧЕНИЯ К CLICKHOUSE и Keycloack Postgres (ДЛЯ DAG'ОВ) ----------
+      AIRFLOW_CONN_CLICKHOUSE_DEFAULT: '{"conn_type":"generic","host":"clickhouse","port":9000,"login":"airflow_user","password":"airflow_password","schema":"reports_db","extra":{}}'
+      AIRFLOW_CONN_KEYCLOAK_DB_DEFAULT: '{"conn_type":"postgres","host":"keycloak_db","port":5432,"login":"keycloak_user","password":"keycloak_password","schema":"keycloak_db","extra":{}}'
       
       # ---------- БЕЗОПАСНОСТЬ ----------
       AIRFLOW__CORE__FERNET_KEY: ''
