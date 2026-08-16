@@ -11,32 +11,321 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+  
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      KC_DB: postgres
+      KEYCLOAK_ADMIN: admin                   
+      KEYCLOAK_ADMIN_PASSWORD: admin         
+      KC_DB: postgres                          
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
-      KC_DB_USERNAME: keycloak_user
-      KC_DB_PASSWORD: keycloak_password
+      KC_DB_USERNAME: keycloak_user            
+      KC_DB_PASSWORD: keycloak_password       
     command: 
-      - start-dev
-      - --import-realm
+      - start-dev                              
+      - --import-realm                         
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
-      - "8080:8080"
+      - "8080:8080"                            
     depends_on:
-      - keycloak_db
+      - keycloak_db                            
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "3000:3000"                            
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_API_URL: http://localhost:8001
+      REACT_APP_KEYCLOAK_URL: http://localhost:8080 
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  # ============================================
+  # CLICKHOUSE ДЛЯ АНАЛИТИКИ (НЕ ДЛЯ МЕТАДАННЫХ AIRFLOW!)
+  # ============================================
+  
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.7.3
+    container_name: clickhouse
+    hostname: clickhouse
+    ports:
+      - "8123:8123"  # HTTP API
+      - "9000:9000"  # Native protocol
+    volumes:
+      - ./clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
+    environment:
+      CLICKHOUSE_DB: reports_db
+      CLICKHOUSE_USER: airflow_user
+      CLICKHOUSE_PASSWORD: airflow_password
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # ============================================
+  # AIRFLOW С POSTGRESQL ДЛЯ МЕТАДАННЫХ
+  # ============================================
+  
+  postgres:
+    image: postgres:16.0                     
+    volumes:
+      - ./task2/docker/db/init-db.sql:/docker-entrypoint-initdb.d/db.sql
+      - ./postgres-airflow-data:/var/lib/postgresql/data  # Сохраняем данные
+    environment:
+      POSTGRES_USER: airflow                   
+      POSTGRES_PASSWORD: airflow             
+      POSTGRES_DB: airflow                    
+    ports:
+      - "5432:5432"  # Опционально, если нужно подключиться с хоста
+    logging:
+      options:
+        max-size: 10m                         
+        max-file: "3"                         
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s                            
+      retries: 5                               
+      start_period: 5s                         
+    restart: always                            
+
+  # ============================================
+  # ШАБЛОН ДЛЯ ВСЕХ СЕРВИСОВ AIRFLOW
+  # ============================================
+  
+  x-airflow-common: &airflow-common
+    build:
+      context: .                              
+      dockerfile: task2/docker/airflow/Dockerfile  
+    environment: &airflow-common-env
+      # ---------- НАСТРОЙКИ EXECUTOR'а ----------
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      
+      # ---------- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ (ОСТАЁТСЯ POSTGRESQL) ----------
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      
+      # ---------- ПОДКЛЮЧЕНИЯ К CLICKHOUSE и Keycloack Postgres (ДЛЯ DAG'ОВ) ----------
+      AIRFLOW_CONN_CLICKHOUSE_DEFAULT: '{"conn_type":"generic","host":"clickhouse","port":9000,"login":"airflow_user","password":"airflow_password","schema":"reports_db","extra":{}}'
+      AIRFLOW_CONN_KEYCLOAK_DB_DEFAULT: '{"conn_type":"postgres","host":"keycloak_db","port":5432,"login":"keycloak_user","password":"keycloak_password","schema":"keycloak_db","extra":{}}'
+      
+      # ---------- БЕЗОПАСНОСТЬ ----------
+      AIRFLOW__CORE__FERNET_KEY: ''
+      
+      # ---------- ПОВЕДЕНИЕ DAG'ОВ ----------
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      
+      # ---------- API ----------
+      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+      
+      # ---------- SCHEDULER ----------
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+      
+      # ---------- WEBSERVER ----------
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'your_airflow_webserver_sec_key'
+      
+      # ---------- ДОПОЛНИТЕЛЬНЫЕ ПАКЕТЫ ----------
+      _PIP_ADDITIONAL_REQUIREMENTS: 'clickhouse-driver==0.2.6 clickhouse-connect==0.7.6'
+      
+      # ---------- КАСТОМНЫЕ ПЕРЕМЕННЫЕ ----------
+      AIRFLOW_INPUT_DIR: '/opt/airflow/dag-inputs'
+    
+    volumes:
+      - ./task2/dags:/opt/airflow/dags
+      - ./task2/dags/sql:/opt/airflow/dags/sql
+      - ./task2/docker/airflow/requirements.txt:/opt/airflow/requirements.txt
+      - ./data:/opt/airflow/sample_files
+    
+    user: "${AIRFLOW_UID:-50000}:0"
+    
+    depends_on: &airflow-common-depends-on
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  # ---------- AIRFLOW SERVICES ----------
+  
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8081:8080"  # Изменён порт, чтобы не конфликтовать с Keycloak
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-triggerer:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: bash -c "airflow triggerer"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - airflow jobs check --job-type TriggererJob --hostname "${HOSTNAME}"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  airflow-cli:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    profiles:
+      - debug
+    command:
+      - bash
+      - -c
+      - airflow
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    command: >
+       bash -c "airflow db init && airflow users create -u admin -f admin -l admin -r Admin -e admin@sample.ru -p admin"
+
+  # ============================================
+  # KAFKA + ZOOKEEPER
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"      # Для подключения с хоста
+      - "29092:29092"    # Для подключения между контейнерами
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_INTERNAL://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    restart: unless-stopped
+
+  # ============================================
+  # KAFKA UI 
+  # ============================================
+  
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8083:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  # ============================================
+  # СЕРВИС ТЕЛЕМЕТРИИ (из папки prothesis-telemetry)
+  # ============================================
+  
+  prothesis-telemetry:
+    build:
+      context: ./prothesis-telemetry
+      dockerfile: Dockerfile         
+    container_name: prothesis-telemetry
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: prothesis-telemetry
+      KAFKA_CLIENT_ID: prothesis-simulator
+      SEND_INTERVAL: 5
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+
+  # ============================================
+  # СЕРВИС ТЕЛЕМЕТРИИ (из папки prothesis-telemetry)
+  # ============================================
+  
+  reports-api:
+    build: ./reports-api
+    container_name: reports-api
+    ports:
+      - "8001:8001"
+    environment:
+      PYTHONUNBUFFERED: 1
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: airflow_user
+      CLICKHOUSE_PASSWORD: airflow_password
+      CLICKHOUSE_DATABASE: reports_db
+      KEYCLOAK_URL: "http://keycloak:8080"
+      KEYCLOAK_REALM: reports-realm
+      KEYCLOAK_ALGORYTHM: RS256
+      KEYCLOAK_CLIENT_ID: reports-api
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

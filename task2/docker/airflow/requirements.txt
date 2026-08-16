@@ -1,0 +1,4 @@
+psycopg2-binary==2.9.9
+clickhouse-driver==0.2.6
+clickhouse-connect==0.7.6
+kafka-python==2.0.2
