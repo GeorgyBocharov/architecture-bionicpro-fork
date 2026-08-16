@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+import logging
+import time
+from fastapi import FastAPI, Request, HTTPException, Query, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
+import uvicorn
 import clickhouse_connect
 import jwt
-import logging
 from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel
@@ -10,22 +13,20 @@ import os
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from jwt import PyJWKClient
-
-
-load_dotenv()
+from cryptography.hazmat.primitives import serialization
 
 # ==================== КОНФИГУРАЦИЯ ====================
 KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://keycloak:8080")
 KEYCLOAK_REALM = os.getenv("KEYCLOAK_REALM", "reports-realm")
 KEYCLOAK_ALGORYTHM = os.getenv("KEYCLOAK_REALM", "RS256")
 KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "reports-api")
-KEYCLOAK_PUBLIC_KEY = os.getenv("KEYCLOAK_PUBLIC_KEY", "").replace('\\n', '\n')
 
 # URL для получения JWKS (публичных ключей)
 JWKS_URL = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/certs"
 
 # Инициализация клиента для получения ключей
 jwks_client = PyJWKClient(JWKS_URL)
+public_key_cache = None
 
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST", "clickhouse")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", 8123))
@@ -60,96 +61,19 @@ class ReportResponse(BaseModel):
 class ErrorResponse(BaseModel):
     detail: str
 
-
 security = HTTPBearer()
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
-def get_user_id_from_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """
-    Извлекает user_id из JWT токена Keycloak с логированием
-    """
-    request_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    token_preview = credentials.credentials[:20] + "..." if credentials.credentials else "None"
-    
-    logger.info(f"[{request_id}] Starting token validation. Token preview: {token_preview}")
-    
-    try:
-        token = credentials.credentials
-        
-        if not token:
-            logger.warning(f"[{request_id}] Empty token received")
-            raise HTTPException(status_code=401, detail="Empty token")
-        
-        logger.debug(f"[{request_id}] Attempting to get signing key for token")
 
-        
-        # Декодируем и верифицируем токен
-        try:
-            payload = jwt.decode(
-                token,
-                KEYCLOAK_PUBLIC_KEY,
-                algorithms=["RS256"],
-                audience=KEYCLOAK_CLIENT_ID,
-                options={"verify_aud": False}
-            )
-            logger.debug(f"[{request_id}] Token successfully decoded")
-        except jwt.ExpiredSignatureError as e:
-            logger.warning(f"[{request_id}] Token has expired")
-            raise HTTPException(status_code=401, detail="Token has expired")
-        except jwt.InvalidAudienceError as e:
-            logger.warning(f"[{request_id}] Invalid audience. Expected: {KEYCLOAK_CLIENT_ID}")
-            raise HTTPException(status_code=401, detail=f"Invalid audience. Expected: {KEYCLOAK_CLIENT_ID}")
-        except jwt.InvalidIssuerError as e:
-            logger.warning(f"[{request_id}] Invalid issuer")
-            raise HTTPException(status_code=401, detail="Invalid issuer")
-        except jwt.InvalidTokenError as e:
-            logger.warning(f"[{request_id}] Invalid token: {str(e)}")
-            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
-        except Exception as e:
-            logger.error(f"[{request_id}] Unexpected error during token decode: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=401, detail=f"Token decode error: {str(e)}")
-
-
-        azp = payload.get("azp")
-        logger.info(f"[{request_id}] azp is {azp}")
-        
-        # Извлекаем user_id только из поля sub
-        user_id = payload.get("sub")
-        
-        if not user_id:
-            logger.error(f"[{request_id}] User ID (sub) not found in token")
-            raise HTTPException(status_code=401, detail="User ID (sub) not found in token")
-        
-        # Логируем успешную аутентификацию
-        logger.info(f"[{request_id}] Successfully authenticated user: {user_id}")
-        
-        return str(user_id)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[{request_id}] Unexpected error in token validation: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=401, detail=f"Authentication error: {str(e)}")
-
-def get_clickhouse_client():
-    """Подключение к ClickHouse"""
-    try:
-        return clickhouse_connect.get_client(
-            host=CLICKHOUSE_HOST,
-            port=CLICKHOUSE_PORT,
-            username=CLICKHOUSE_USER,
-            password=CLICKHOUSE_PASSWORD,
-            database=CLICKHOUSE_DATABASE
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to connect to ClickHouse: {str(e)}")
-
-# ==================== ПРИЛОЖЕНИЕ ====================
-app = FastAPI(
-    title="Prosthesis Telemetry Report API",
-    version="1.0.0",
-    description="API для получения средних показателей телеметрии протезов"
-)
+# Приложение
+app = FastAPI(title="Health Check Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -161,31 +85,7 @@ app.add_middleware(
     max_age=3600, 
 )
 
-@app.get(
-    "/v1/report",
-    response_model=ReportResponse,
-    summary="Получить отчет по телеметрии",
-    description="Возвращает средние показатели телеметрии для протезов рук и ног за указанный период"
-)
-async def get_report(
-    period_start: str = Query(..., description="Начало периода (YYYY-MM-DD)", example="2026-01-01"),
-    period_end: str = Query(..., description="Конец периода (YYYY-MM-DD)", example="2026-01-31"),
-    user_id: str = Depends(get_user_id_from_token)
-):
-    return getReportByUserAndPeriod(period_start, period_end, user_id)
-
-@app.get(
-    "/v1/reportUnsafe",
-    response_model=ReportResponse,
-    summary="Получить отчет по телеметрии (без аутентификации)",
-    description="Возвращает средние показатели телеметрии для протезов рук и ног за указанный период"
-)
-async def get_report_unsafe(
-    period_start: str = Query(..., description="Начало периода (YYYY-MM-DD)", example="2026-01-01"),
-    period_end: str = Query(..., description="Конец периода (YYYY-MM-DD)", example="2026-01-31"),
-    user_id: str = Query(..., description="id пользователя", example="dbd3874d-23f2-40cc-b6cc-3710fe27b5ba")
-):
-    return getReportByUserAndPeriod(period_start, period_end, user_id)
+# Методы
 
 def getReportByUserAndPeriod(period_start, period_end, user_id):
     """Получение средних показателей телеметрии за период"""
@@ -275,16 +175,120 @@ def getReportByUserAndPeriod(period_start, period_end, user_id):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    """Проверка состояния сервиса"""
-    return {"status": "healthy"}
+def get_user_id_from_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """
+    Извлекает user_id из JWT токена Keycloak с логированием
+    """
+    global public_key_cache
+
+    request_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+    token = credentials.credentials
+    if not token:
+        logger.warning(f"[{request_id}] Empty token received")
+        raise HTTPException(status_code=401, detail="Empty token")
+    
+    token_preview = token[:20] + "..."
+    logger.info(f"[{request_id}] Starting token validation. Token preview: {token_preview}")
+
+    if public_key_cache is None:
+        logger.info(f"[{request_id}] requesting public key from keycloak")
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        pem_bytes = signing_key.key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        pem_string = pem_bytes.decode('utf-8')
+        public_key_cache = pem_string
+    else:
+        logger.info(f"[{request_id}] using public key from local cache")
+
+    
+    try:
+        
+        # Декодируем и верифицируем токен
+        try:
+            payload = jwt.decode(
+                token,
+                public_key_cache,
+                algorithms=["RS256"],
+                audience=KEYCLOAK_CLIENT_ID,
+                options={"verify_aud": False}
+            )
+            logger.debug(f"[{request_id}] Token successfully decoded")
+        except jwt.ExpiredSignatureError as e:
+            logger.warning(f"[{request_id}] Token has expired")
+            raise HTTPException(status_code=401, detail="Token has expired")
+        except jwt.InvalidAudienceError as e:
+            logger.warning(f"[{request_id}] Invalid audience. Expected: {KEYCLOAK_CLIENT_ID}")
+            raise HTTPException(status_code=401, detail=f"Invalid audience. Expected: {KEYCLOAK_CLIENT_ID}")
+        except jwt.InvalidIssuerError as e:
+            logger.warning(f"[{request_id}] Invalid issuer")
+            raise HTTPException(status_code=401, detail="Invalid issuer")
+        except jwt.InvalidTokenError as e:
+            logger.warning(f"[{request_id}] Invalid token: {str(e)}")
+            raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+        except Exception as e:
+            logger.error(f"[{request_id}] Unexpected error during token decode: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=401, detail=f"Token decode error: {str(e)}")
+
+
+        azp = payload.get("azp")
+        logger.info(f"[{request_id}] azp is {azp}")
+        
+        # Извлекаем user_id только из поля sub
+        user_id = payload.get("sub")
+        
+        if not user_id:
+            logger.error(f"[{request_id}] User ID (sub) not found in token")
+            raise HTTPException(status_code=401, detail="User ID (sub) not found in token")
+        
+        # Логируем успешную аутентификацию
+        logger.info(f"[{request_id}] Successfully authenticated user: {user_id}")
+        
+        return str(user_id)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Unexpected error in token validation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=401, detail=f"Authentication error: {str(e)}")
+
+def get_clickhouse_client():
+    """Подключение к ClickHouse"""
+    try:
+        return clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT,
+            username=CLICKHOUSE_USER,
+            password=CLICKHOUSE_PASSWORD,
+            database=CLICKHOUSE_DATABASE
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to connect to ClickHouse: {str(e)}")
+
+
+@app.get(
+    "/v1/report",
+    response_model=ReportResponse,
+    summary="Получить отчет по телеметрии",
+    description="Возвращает средние показатели телеметрии для протезов рук и ног за указанный период"
+)
+async def get_report(
+    period_start: str = Query(..., description="Начало периода (YYYY-MM-DD)", example="2026-01-01"),
+    period_end: str = Query(..., description="Конец периода (YYYY-MM-DD)", example="2026-01-31"),
+    user_id: str = Depends(get_user_id_from_token)
+):
+    return getReportByUserAndPeriod(period_start, period_end, user_id)
 
 if __name__ == "__main__":
-    import uvicorn
+    logger.info("Запуск FastAPI сервера на порту 8001...")
     uvicorn.run(
-        "main:app",
+        "app:app",
         host="0.0.0.0",
         port=8001,
-        reload=True
+        log_level="info",
+        access_log=False  
     )
+
+

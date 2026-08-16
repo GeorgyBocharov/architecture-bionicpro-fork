@@ -2,17 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-ENV PORT=8001
-
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
+COPY app.py .
 
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+RUN addgroup --system --gid 1001 appuser && \
+    adduser --system --uid 1001 --gid 1001 appuser
+
 USER appuser
 
-EXPOSE ${PORT}
+EXPOSE 8001
 
-CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["python", "app.py"]

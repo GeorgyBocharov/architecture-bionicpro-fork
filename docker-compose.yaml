@@ -48,7 +48,7 @@ services:
   # ============================================
   
   clickhouse:
-    image: clickhouse/clickhouse-server:23.12
+    image: clickhouse/clickhouse-server:26.7.3
     container_name: clickhouse
     hostname: clickhouse
     ports:
@@ -56,8 +56,7 @@ services:
       - "9000:9000"  # Native protocol
     volumes:
       - ./clickhouse-data:/var/lib/clickhouse
-      - ./clickhouse-config:/etc/clickhouse-server/users.d
-      - ./clickhouse-init/init.sql:/docker-entrypoint-initdb.d/db.sql
+      - ./clickhouse-init:/docker-entrypoint-initdb.d
     environment:
       CLICKHOUSE_DB: reports_db
       CLICKHOUSE_USER: airflow_user
@@ -308,15 +307,12 @@ services:
   # ============================================
   
   reports-api:
-    build:
-      context: ./reports-api
-      dockerfile: Dockerfile         
+    build: ./reports-api
     container_name: reports-api
-    depends_on:
-      - clickhouse
     ports:
       - "8001:8001"
     environment:
+      PYTHONUNBUFFERED: 1
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: airflow_user
@@ -326,6 +322,10 @@ services:
       KEYCLOAK_REALM: reports-realm
       KEYCLOAK_ALGORYTHM: RS256
       KEYCLOAK_CLIENT_ID: reports-api
-      KEYCLOAK_PUBLIC_KEY: -----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxnlengu/GaiZdgT8hRMSitdv08c9Gs2EAhOlAvZhk2zCw6LdrtghKHmb6LC+jgJ1C9CH3a1deN/lxDZalXiaHsX3R/CwvU5Bqg5JRYlSSeQcN3csVhWihWJTBUpgi8G6XMxd9qGEBENWVdsPatooNVMENPH65cXagmc47B9JWwqza39i7erMMT+B8OCpMhqNWIkg4juq0bQ2ufrLvEakgaGe2+G1uCmRnhtuMJDw49Fi5eY8Wo3MzFi+9kfO7vmPD+IuEejwvLdh1SVoE1TMjbR3DM+fcQFlpcZNg0bAjaqI3Emzfb1ZGcBWy0ItvsgCswOv/uadm3d7MKixgzwLzwIDAQAB\n-----END PUBLIC KEY-----
       LOG_LEVEL: INFO
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
